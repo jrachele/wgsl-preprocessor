@@ -28,6 +28,7 @@ const ShaderPreprocessor = struct {
 
     const Error = error{
         InvalidCondition,
+        InvalidConstant,
         InvalidPath,
         InvalidFile,
         InvalidImport,
@@ -105,18 +106,18 @@ const ShaderPreprocessor = struct {
 
             // Parse conditions first as later processing is contingent on conditions
             if (std.mem.startsWith(u8, trimmed_line, "#if")) {
-                const condStr = self.parseIf(trimmed_line) catch |err| {
+                const cond_str = self.parseIf(trimmed_line) catch |err| {
                     logError(err, log_data);
                     return err;
                 };
-                defer self.allocator.free(condStr);
+                defer self.allocator.free(cond_str);
 
                 // Match conditions found in the shader with conditions passed through as options to this function
                 var cond_valid = false;
                 var cond = false;
                 if (@hasField(@TypeOf(options), "conditions")) {
                     inline for (std.meta.fields(@TypeOf(options.conditions))) |field| {
-                        if (std.mem.eql(u8, field.name, condStr)) {
+                        if (std.mem.eql(u8, field.name, cond_str)) {
                             cond_valid = true;
                             cond = @field(options.conditions, field.name);
                         }
@@ -174,11 +175,54 @@ const ShaderPreprocessor = struct {
                     return Error.AllocatorError;
                 };
             } else {
-                // TODO: Add more macros
-                // Normal wgsl
-                process_array.appendSlice(line) catch {
-                    return Error.AllocatorError;
-                };
+
+                // Lastly, check if there is a constant #(foo) inlined somewhere
+                // TODO: Allow multiple constants per line
+                const pound_index = std.mem.indexOfScalar(u8, line, '#');
+                if (pound_index) |pound_i| {
+                    const constant_ident = self.parseConstant(line[pound_i..]) catch |err| {
+                        logError(err, log_data);
+                        return err;
+                    };
+                    defer self.allocator.free(constant_ident);
+
+                    var const_valid = false;
+                    // TODO: This seems a little fishy
+                    var valueBuf: [128]u8 = undefined;
+                    var value: []u8 = "";
+
+                    if (@hasField(@TypeOf(options), "constants")) {
+                        inline for (std.meta.fields(@TypeOf(options.constants))) |field| {
+                            if (std.mem.eql(u8, field.name, constant_ident)) {
+                                const_valid = true;
+                                const val = @field(options.constants, field.name);
+                                value = std.fmt.bufPrint(&valueBuf, "{any}", .{val}) catch {
+                                    return Error.InvalidConstant;
+                                };
+                            }
+                        }
+                    }
+
+                    if (const_valid == false) {
+                        const err = Error.InvalidConstant;
+                        logError(err, log_data);
+                        return err;
+                    }
+
+                    // Process the line
+                    var lineBuf: [128]u8 = undefined;
+                    var newLine = std.fmt.bufPrint(&lineBuf, "{s}{s}{s}", .{ line[0..pound_i], value, line[pound_i + constant_ident.len + 3 ..] }) catch {
+                        return Error.SyntaxError;
+                    };
+
+                    process_array.appendSlice(newLine) catch {
+                        return Error.AllocatorError;
+                    };
+                } else {
+                    process_array.appendSlice(line) catch {
+                        return Error.AllocatorError;
+                    };
+                }
             }
             if (it.rest().len > 0) {
                 process_array.append('\n') catch {
@@ -263,6 +307,9 @@ const ShaderPreprocessor = struct {
             Error.InvalidCondition => {
                 log("Invalid condition! (Ensure you have it defined in your process options)", log_data);
             },
+            Error.InvalidConstant => {
+                log("Invalid constant! (Ensure you have it defined in your process options)", log_data);
+            },
             Error.InvalidImport => {
                 log("Invalid import!", log_data);
             },
@@ -316,11 +363,7 @@ const ShaderPreprocessor = struct {
                     mecha.ascii.char('/'),
                 })),
                 // ___
-                mecha.opt(mecha.many(mecha.ascii.char('_'), .{})),
-                // somePath12
-                mecha.many(mecha.ascii.alphanumeric, .{}),
-                // ___
-                mecha.opt(mecha.many(mecha.ascii.char('_'), .{})),
+                mechaParseIdent(),
                 // /
                 mecha.opt(mecha.ascii.char('/')),
             }), .{
@@ -362,18 +405,7 @@ const ShaderPreprocessor = struct {
     fn parseIf(self: *Self, raw_line: []const u8) Error![]const u8 {
         const if_statement = comptime mecha.string("#if");
 
-        const underscore_alphanum = comptime mecha.combine(.{
-            mecha.opt(mecha.many(mecha.ascii.char('_'), .{ .collect = false })),
-            // somePath12
-            mecha.many(mecha.ascii.alphanumeric, .{
-                .collect = false,
-            }),
-        });
-
-        const condition = comptime mecha.many(underscore_alphanum, .{
-            .collect = false,
-            .max = 16,
-        });
+        const condition = comptime mechaParseIdent();
 
         const combined = comptime mecha.combine(.{
             if_statement.discard(),
@@ -387,14 +419,52 @@ const ShaderPreprocessor = struct {
             return Error.SyntaxError;
         };
 
-        var cond_result = std.ArrayList(u8).init(self.allocator);
-        cond_result.appendSlice(result.value) catch {
+        return self.allocator.dupe(u8, result.value) catch {
             return Error.AllocatorError;
+        };
+    }
+
+    // Extract the constant from an embedded constant in a line
+    // e.g.
+    // var a = #(some_constant)
+    //
+    // This function will return "some_constant"
+    //
+    // Note: It will only return the first constant found in the slice
+    fn parseConstant(self: *Self, raw_line: []const u8) Error![]const u8 {
+        const constant = comptime mecha.string("#(");
+        const rightparen = comptime mecha.ascii.char(')');
+
+        const combined = comptime mecha.combine(.{
+            constant.discard(),
+            mechaParseIdent(),
+            rightparen.discard(),
+        });
+
+        const result = combined.parse(self.arena.allocator(), raw_line) catch {
+            return Error.SyntaxError;
         };
 
-        return cond_result.toOwnedSlice() catch {
+        return self.allocator.dupe(u8, result.value) catch {
             return Error.AllocatorError;
         };
+    }
+
+    fn mechaParseIdent() mecha.Parser([]const u8) {
+        const underscore_alphanum = comptime mecha.combine(.{
+            mecha.opt(mecha.many(mecha.ascii.char('_'), .{ .collect = false })),
+            // somePath12
+            mecha.many(mecha.ascii.alphanumeric, .{
+                .collect = false,
+            }),
+        });
+
+        const ident = comptime mecha.many(underscore_alphanum, .{
+            .collect = false,
+            .max = 16,
+        });
+
+        return ident;
     }
 };
 
@@ -465,6 +535,26 @@ test "process conditional success" {
     ;
 
     try std.testing.expectEqualStrings(expected_false, result_false);
+}
+
+test "process constant success" {
+    const allocator = std.testing.allocator;
+    var preprocessor = ShaderPreprocessor.init(allocator);
+    defer preprocessor.deinit();
+
+    const result = try preprocessor.process("./test/constant.wgsl", .{
+        .constants = .{
+            .some_constant = 100,
+        },
+    });
+    defer allocator.free(result);
+
+    const expected =
+        \\var a = 10;
+        \\var b = 100;
+    ;
+
+    try std.testing.expectEqualStrings(expected, result);
 }
 
 test "parseImportPath success" {
