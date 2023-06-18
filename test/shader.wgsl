@@ -1,4 +1,4 @@
-#import "other_shader.wgsl"
+    #import "other_shader.wgsl"
 
 @group(0) @binding(0)
 var<storage, read> buf: array<u32>;
