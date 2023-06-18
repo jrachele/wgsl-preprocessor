@@ -19,11 +19,15 @@ const ShaderPreprocessor = struct {
     arena: std.heap.ArenaAllocator,
     visited_paths: std.StringHashMap(void),
 
+    // Stack to ensure proper if-endif formation
+    conditions: std.ArrayList(bool),
+
     const Self = @This();
     const Megabytes: usize = 1024 * 1024;
     const MAX_FILE_READ_BYTES: usize = 8 * Megabytes;
 
     const Error = error{
+        InvalidCondition,
         InvalidPath,
         InvalidFile,
         InvalidImport,
@@ -31,6 +35,7 @@ const ShaderPreprocessor = struct {
         CacheError,
         SyntaxError,
         AllocatorError,
+        MismatchedIf,
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -39,6 +44,7 @@ const ShaderPreprocessor = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .shader_file_cache = std.StringHashMap([]const u8).init(allocator),
             .visited_paths = std.StringHashMap(void).init(allocator),
+            .conditions = std.ArrayList(bool).init(allocator),
         };
     }
 
@@ -46,9 +52,22 @@ const ShaderPreprocessor = struct {
         self.arena.deinit();
         self.shader_file_cache.deinit();
         self.visited_paths.deinit();
+        self.conditions.deinit();
     }
 
-    pub fn process(self: *Self, path: []const u8) Error![]const u8 {
+    // Processes the shader at the given path
+    // Options can be given as such:
+    // .{
+    //  .conditions = .{
+    //      .full_screen = true,
+    //      .mouse_hidden = global.config.mouse_hidden,
+    //  },
+    //  .constants = .{
+    //      .screen_width = 1280,
+    //      .screen_height = 720
+    //  }
+    // }
+    pub fn process(self: *Self, path: []const u8, options: anytype) Error![]const u8 {
         var path_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
         const abs_path = std.fs.realpath(path, &path_buffer) catch {
             return Error.InvalidPath;
@@ -75,6 +94,7 @@ const ShaderPreprocessor = struct {
         var it = std.mem.splitScalar(u8, file_bytes, '\n');
         var i: u32 = 0;
         while (it.next()) |line| : (i += 1) {
+
             // Only throw parser errors if the line is meant to be parsed, i.e. starts with #
             const trimmed_line = std.mem.trim(u8, line, " \t");
             const log_data = LogData{
@@ -83,8 +103,69 @@ const ShaderPreprocessor = struct {
                 .line_contents = line,
             };
 
+            // Parse conditions first as later processing is contingent on conditions
+            if (std.mem.startsWith(u8, trimmed_line, "#if")) {
+                const condStr = self.parseIf(trimmed_line) catch |err| {
+                    logError(err, log_data);
+                    return err;
+                };
+                defer self.allocator.free(condStr);
+
+                // Match conditions found in the shader with conditions passed through as options to this function
+                var cond_valid = false;
+                var cond = false;
+                if (@hasField(@TypeOf(options), "conditions")) {
+                    inline for (std.meta.fields(@TypeOf(options.conditions))) |field| {
+                        if (std.mem.eql(u8, field.name, condStr)) {
+                            cond_valid = true;
+                            cond = @field(options.conditions, field.name);
+                        }
+                    }
+                }
+
+                if (cond_valid == false) {
+                    const err = Error.InvalidCondition;
+                    logError(err, log_data);
+                    return err;
+                }
+
+                self.conditions.append(cond) catch {
+                    return Error.AllocatorError;
+                };
+                continue;
+            } else if (std.mem.startsWith(u8, trimmed_line, "#else")) {
+                if (self.conditions.popOrNull()) |cond| {
+                    self.conditions.append(!cond) catch {
+                        return Error.AllocatorError;
+                    };
+                } else {
+                    const err = Error.MismatchedIf;
+                    logError(err, log_data);
+                    return err;
+                }
+                continue;
+            } else if (std.mem.startsWith(u8, trimmed_line, "#endif")) {
+                if (self.conditions.popOrNull() == null) {
+                    const err = Error.MismatchedIf;
+                    logError(err, log_data);
+                    return err;
+                }
+                continue;
+            }
+
+            // If we are in an #if block, however nested, ensure we satisfy all conditions to
+            // actually further process any lines
+            var can_process = true;
+            for (self.conditions.items) |cond| {
+                can_process = cond and can_process;
+            }
+
+            if (!can_process) {
+                continue;
+            }
+
             if (std.mem.startsWith(u8, trimmed_line, "#import")) {
-                const import_bytes = self.processImport(abs_path, trimmed_line) catch |err| {
+                const import_bytes = self.processImport(abs_path, trimmed_line, options) catch |err| {
                     logError(err, log_data);
                     return err;
                 };
@@ -106,6 +187,10 @@ const ShaderPreprocessor = struct {
             }
         }
 
+        if (self.conditions.items.len != 0) {
+            return Error.MismatchedIf;
+        }
+
         const shader_content = process_array.toOwnedSlice() catch {
             return Error.AllocatorError;
         };
@@ -116,6 +201,48 @@ const ShaderPreprocessor = struct {
         return shader_content;
     }
 
+    fn processImport(self: *Self, abs_path: []const u8, line: []const u8, options: anytype) Error![]const u8 {
+        const import_path = self.parseImportPath(line) catch {
+            return Error.InvalidImport;
+        };
+
+        // #import "path/to/shader.wgsl"
+        // We are given ownership of the path slice from parseImportPath, so we free it ourselves
+        defer self.allocator.free(import_path);
+
+        var import_path_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        var import_abs_path: []const u8 = undefined;
+
+        if (std.fs.path.isAbsolute(import_path)) {
+            import_abs_path = std.fs.realpath(import_path, &import_path_buffer) catch {
+                return Error.InvalidImport;
+            };
+        } else {
+            // If we were given a relative path, ensure we are resolving it relative to the shader itself, not where we are running this
+            const dirname = std.fs.path.dirname(abs_path).?;
+            const p2 = std.fs.path.join(self.allocator, &[_][]const u8{ dirname, import_path }) catch {
+                return Error.InvalidImport;
+            };
+            defer self.allocator.free(p2);
+            import_abs_path = std.fs.realpath(p2, &import_path_buffer) catch {
+                return Error.InvalidImport;
+            };
+        }
+
+        if (std.mem.eql(u8, abs_path, import_abs_path) or self.visited_paths.contains(import_abs_path)) {
+            return Error.CyclicImport;
+        }
+
+        if (self.shader_file_cache.contains(import_abs_path)) {
+            return self.shader_file_cache.get(import_abs_path).?;
+        }
+
+        // Recursive call to evaluate other imports
+        const import_file_bytes = try self.process(import_abs_path, options);
+
+        return import_file_bytes;
+    }
+
     const LogData = struct {
         path: []const u8,
         line_number: u32,
@@ -124,17 +251,32 @@ const ShaderPreprocessor = struct {
 
     fn logError(err: Error, log_data: LogData) void {
         switch (err) {
-            Error.InvalidImport => {
-                log("Invalid import!", log_data);
+            Error.AllocatorError => {
+                log("Error allocating memory!", log_data);
+            },
+            Error.CacheError => {
+                log("Error retrieving shader from cache!", log_data);
             },
             Error.CyclicImport => {
                 log("Cycle detected in imports!", log_data);
+            },
+            Error.InvalidCondition => {
+                log("Invalid condition! (Ensure you have it defined in your process options)", log_data);
+            },
+            Error.InvalidImport => {
+                log("Invalid import!", log_data);
+            },
+            Error.InvalidPath => {
+                log("Invalid file path!", log_data);
+            },
+            Error.MismatchedIf => {
+                log("Mismatched #if, #else, or #endif!", log_data);
             },
             Error.SyntaxError => {
                 log("Syntax error!", log_data);
             },
             else => {
-                log("Error occured during import!", log_data);
+                log("Error occured during preprocessing!", log_data);
             },
         }
     }
@@ -148,57 +290,21 @@ const ShaderPreprocessor = struct {
         });
     }
 
-    fn processImport(self: *Self, abs_path: []const u8, line: []const u8) ![]const u8 {
-        const import_path = self.parseImportPath(line) catch {
-            return Error.InvalidImport;
-        };
+    //////////////////////////////////////////////////////////////////////
+    // Parsers
+    //////////////////////////////////////////////////////////////////////
 
-        // #import "path/to/shader.wgsl"
-        if (import_path) |p| {
-            // We are given ownership of the path slice from parseImportPath, so we free it ourselves
-            defer self.allocator.free(p);
+    const linebreak = mecha.opt(mecha.ascii.char('\n'));
+    const whitespace = mecha.opt(mecha.many(mecha.ascii.whitespace, .{}));
 
-            var import_path_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-            var import_abs_path: []const u8 = undefined;
-
-            if (std.fs.path.isAbsolute(p)) {
-                import_abs_path = std.fs.realpath(p, &import_path_buffer) catch {
-                    return Error.InvalidImport;
-                };
-            } else {
-                // If we were given a relative path, ensure we are resolving it relative to the shader itself, not where we are running this
-                const dirname = std.fs.path.dirname(abs_path).?;
-                const p2 = std.fs.path.join(self.allocator, &[_][]const u8{ dirname, p }) catch {
-                    return Error.InvalidImport;
-                };
-                defer self.allocator.free(p2);
-                import_abs_path = std.fs.realpath(p2, &import_path_buffer) catch {
-                    return Error.InvalidImport;
-                };
-            }
-
-            if (std.mem.eql(u8, abs_path, import_abs_path) or self.visited_paths.contains(import_abs_path)) {
-                return Error.CyclicImport;
-            }
-
-            if (self.shader_file_cache.contains(import_abs_path)) {
-                return self.shader_file_cache.get(import_abs_path).?;
-            }
-
-            // Recursive call to evaluate other imports
-            const import_file_bytes = try self.process(import_abs_path);
-
-            return import_file_bytes;
-        } else {
-            return Error.SyntaxError;
-        }
-    }
-
-    fn parseImportPath(self: *Self, raw_line: []const u8) !?[]const u8 {
+    // Extract the import path from an #import statement
+    // e.g.
+    // #import "path/to/foo.wgsl"
+    //
+    // This function will return "path/to/foo.wgsl"
+    fn parseImportPath(self: *Self, raw_line: []const u8) ![]const u8 {
         const import = comptime mecha.string("#import");
         const quote = comptime mecha.ascii.char('\"');
-        const linebreak = comptime mecha.opt(mecha.ascii.char('\n'));
-        const whitespace = comptime mecha.opt(mecha.many(mecha.ascii.whitespace, .{}));
 
         // Path
         const extension = comptime mecha.string(".wgsl");
@@ -213,6 +319,8 @@ const ShaderPreprocessor = struct {
                 mecha.opt(mecha.many(mecha.ascii.char('_'), .{})),
                 // somePath12
                 mecha.many(mecha.ascii.alphanumeric, .{}),
+                // ___
+                mecha.opt(mecha.many(mecha.ascii.char('_'), .{})),
                 // /
                 mecha.opt(mecha.ascii.char('/')),
             }), .{
@@ -243,14 +351,63 @@ const ShaderPreprocessor = struct {
 
         return try path_result.toOwnedSlice();
     }
+
+    // Extract the if condition from an #if statement
+    // e.g.
+    // #if some_value
+    // var foo = 50;
+    // #endif
+    //
+    // This function will return "some_value"
+    fn parseIf(self: *Self, raw_line: []const u8) Error![]const u8 {
+        const if_statement = comptime mecha.string("#if");
+
+        const underscore_alphanum = comptime mecha.combine(.{
+            mecha.opt(mecha.many(mecha.ascii.char('_'), .{ .collect = false })),
+            // somePath12
+            mecha.many(mecha.ascii.alphanumeric, .{
+                .collect = false,
+            }),
+        });
+
+        const condition = comptime mecha.many(underscore_alphanum, .{
+            .collect = false,
+            .max = 16,
+        });
+
+        const combined = comptime mecha.combine(.{
+            if_statement.discard(),
+            whitespace.discard(),
+            condition,
+            whitespace.discard(),
+            linebreak.discard(),
+        });
+
+        const result = combined.parse(self.arena.allocator(), raw_line) catch {
+            return Error.SyntaxError;
+        };
+
+        var cond_result = std.ArrayList(u8).init(self.allocator);
+        cond_result.appendSlice(result.value) catch {
+            return Error.AllocatorError;
+        };
+
+        return cond_result.toOwnedSlice() catch {
+            return Error.AllocatorError;
+        };
+    }
 };
 
-test "process success" {
+//////////////////////////////////////////////////////////////////////
+// Tests
+//////////////////////////////////////////////////////////////////////
+
+test "process import success" {
     const allocator = std.testing.allocator;
     var preprocessor = ShaderPreprocessor.init(allocator);
     defer preprocessor.deinit();
 
-    const result = try preprocessor.process("./test/shader.wgsl");
+    const result = try preprocessor.process("./test/shader.wgsl", .{});
     defer allocator.free(result);
 
     const expected =
@@ -270,10 +427,44 @@ test "process success" {
     try std.testing.expectEqualStrings(expected, result);
 
     // Tests that recursive imports work
-    const depth_result = try preprocessor.process("./test/depth_shader.wgsl");
+    const depth_result = try preprocessor.process("./test/depth_shader.wgsl", .{});
     defer allocator.free(depth_result);
 
     try std.testing.expectEqualStrings(expected, depth_result);
+}
+
+test "process conditional success" {
+    const allocator = std.testing.allocator;
+    var preprocessor = ShaderPreprocessor.init(allocator);
+    defer preprocessor.deinit();
+
+    const result = try preprocessor.process("./test/conditional.wgsl", .{
+        .conditions = .{
+            .test_condition = true,
+        },
+    });
+    defer allocator.free(result);
+
+    const expected =
+        \\var a = 10;
+        \\
+    ;
+
+    try std.testing.expectEqualStrings(expected, result);
+
+    const result_false = try preprocessor.process("./test/conditional.wgsl", .{
+        .conditions = .{
+            .test_condition = false,
+        },
+    });
+    defer allocator.free(result_false);
+
+    const expected_false =
+        \\var a = 5;
+        \\
+    ;
+
+    try std.testing.expectEqualStrings(expected_false, result_false);
 }
 
 test "parseImportPath success" {
@@ -299,10 +490,9 @@ test "parseImportPath success" {
 
     for (imports, 0..) |value, i| {
         const result = try preprocessor.parseImportPath(value);
-        try std.testing.expect(result != null);
-        errdefer allocator.free(result.?);
-        try std.testing.expectEqualStrings(result.?, paths[i]);
-        allocator.free(result.?);
+        errdefer allocator.free(result);
+        try std.testing.expectEqualStrings(result, paths[i]);
+        allocator.free(result);
     }
 }
 
