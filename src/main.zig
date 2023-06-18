@@ -12,27 +12,35 @@ var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const ShaderPreprocessor = struct {
     allocator: std.mem.Allocator,
 
-    // Internally used by the parser combinators
-    arena: std.heap.ArenaAllocator,
-
     // Contains retrieved shader data from files, cached in memory
     shader_file_cache: std.StringHashMap([]const u8),
+
+    // Fields for internal usage
+    arena: std.heap.ArenaAllocator,
+    visited_paths: std.StringHashMap(void),
 
     const Self = @This();
     const Megabytes: usize = 1024 * 1024;
     const MAX_FILE_READ_BYTES: usize = 8 * Megabytes;
+
+    const Error = error{
+        CyclicImport,
+        Syntax,
+    };
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .shader_file_cache = std.StringHashMap([]const u8).init(allocator),
+            .visited_paths = std.StringHashMap(void).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.arena.deinit();
         self.shader_file_cache.deinit();
+        self.visited_paths.deinit();
     }
 
     pub fn process(self: *Self, path: []const u8) ![]const u8 {
@@ -41,6 +49,9 @@ const ShaderPreprocessor = struct {
 
         const file: std.fs.File = try std.fs.openFileAbsolute(abs_path, .{});
         defer file.close();
+
+        // Mark the current path as visited to avoid infinite recursion if cyclically referenced
+        try self.visited_paths.put(abs_path, {});
 
         const file_bytes = try file.readToEndAlloc(self.allocator, ShaderPreprocessor.MAX_FILE_READ_BYTES);
         defer self.allocator.free(file_bytes);
@@ -51,45 +62,60 @@ const ShaderPreprocessor = struct {
         var it = std.mem.splitScalar(u8, file_bytes, '\n');
         var i: i32 = 0;
         while (it.next()) |line| : (i += 1) {
-            const import_path = try self.getImportPath(line);
+            const import_path = self.getImportPath(line) catch {
+                std.log.err("Syntax error!:\n{s} (line {d}): {s}\n", .{ abs_path, i + 1, line });
+                return Error.Syntax;
+            };
+
+            // #import "path/to/shader.wgsl"
             if (import_path) |p| {
-                // We are given ownership of the path slice from getImportPath
+                // We are given ownership of the path slice from getImportPath, so we free it ourselves
                 defer self.allocator.free(p);
 
                 var import_path_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
                 var import_abs_path: []const u8 = undefined;
+
                 if (std.fs.path.isAbsolute(p)) {
                     import_abs_path = try std.fs.realpath(p, &import_path_buffer);
                 } else {
+                    // If we were given a relative path, ensure we are resolving it relative to the shader itself, not where we are running this
                     const dirname = std.fs.path.dirname(abs_path).?;
                     const p2 = try std.fs.path.join(self.allocator, &[_][]const u8{ dirname, p });
                     defer self.allocator.free(p2);
                     import_abs_path = try std.fs.realpath(p2, &import_path_buffer);
                 }
 
-                // Ignore all preprocessing if we are trying to import ourself
-                // TODO: Recursively process shaders being imported
-                // self.process(import_abs_path);
-                if (!std.mem.eql(u8, abs_path, import_abs_path)) {
-                    if (self.shader_file_cache.contains(import_abs_path)) {
-                        return self.shader_file_cache.get(import_abs_path).?;
-                    }
+                if (std.mem.eql(u8, abs_path, import_abs_path) or self.visited_paths.contains(import_abs_path)) {
+                    std.log.err("Cycle detected in preprocessor imports!\n{s} (line {d}): {s}\n", .{ abs_path, i + 1, line });
+                    return Error.CyclicImport;
+                }
 
-                    const import_file: std.fs.File = try std.fs.openFileAbsolute(import_abs_path, .{});
-                    defer import_file.close();
+                if (self.shader_file_cache.contains(import_abs_path)) {
+                    try process_array.appendSlice(self.shader_file_cache.get(import_abs_path).?);
+                    continue;
+                }
 
-                    const import_file_bytes = try import_file.readToEndAlloc(self.allocator, ShaderPreprocessor.MAX_FILE_READ_BYTES);
-                    defer self.allocator.free(import_file_bytes);
+                // Recursive call to evaluate other imports
+                const import_file_bytes = try self.process(import_abs_path);
+                defer self.allocator.free(import_file_bytes);
 
-                    try process_array.appendSlice(import_file_bytes);
+                try process_array.appendSlice(import_file_bytes);
+                if (it.rest().len > 0) {
+                    try process_array.append('\n');
                 }
             } else {
+                // Normal wgsl
                 try process_array.appendSlice(line);
-                try process_array.append('\n');
+                if (it.rest().len > 0) {
+                    try process_array.append('\n');
+                }
             }
         }
 
-        return try process_array.toOwnedSlice();
+        const shader_content = try process_array.toOwnedSlice();
+        try self.shader_file_cache.put(abs_path, shader_content);
+
+        return shader_content;
     }
 
     fn getImportPath(self: *Self, raw_line: []const u8) !?[]const u8 {
@@ -168,11 +194,15 @@ test "process success" {
         \\fn main() {
         \\  // Shader 1! 
         \\}
-        \\
-        \\
     ;
 
     try std.testing.expectEqualStrings(expected, result);
+
+    // Tests that recursive imports work
+    const depth_result = try preprocessor.process("./test/depth_shader.wgsl");
+    defer allocator.free(depth_result);
+
+    try std.testing.expectEqualStrings(expected, depth_result);
 }
 
 test "getImportPath success" {
