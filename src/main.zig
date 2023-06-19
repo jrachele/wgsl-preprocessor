@@ -25,6 +25,7 @@ const ShaderPreprocessor = struct {
     const Self = @This();
     const Megabytes: usize = 1024 * 1024;
     const MAX_FILE_READ_BYTES: usize = 8 * Megabytes;
+    const MAX_LINE_BYTES: usize = 1024;
 
     const Error = error{
         InvalidCondition,
@@ -104,7 +105,9 @@ const ShaderPreprocessor = struct {
                 .line_contents = line,
             };
 
-            // Parse conditions first as later processing is contingent on conditions
+            //////////////////////////////////////////////////////////////////////
+            // #if some_condition
+            //////////////////////////////////////////////////////////////////////
             if (std.mem.startsWith(u8, trimmed_line, "#if")) {
                 const cond_str = self.parseIf(trimmed_line) catch |err| {
                     logError(err, log_data);
@@ -134,6 +137,9 @@ const ShaderPreprocessor = struct {
                     return Error.AllocatorError;
                 };
                 continue;
+                //////////////////////////////////////////////////////////////////////
+                // #else
+                //////////////////////////////////////////////////////////////////////
             } else if (std.mem.startsWith(u8, trimmed_line, "#else")) {
                 if (self.conditions.popOrNull()) |cond| {
                     self.conditions.append(!cond) catch {
@@ -145,6 +151,9 @@ const ShaderPreprocessor = struct {
                     return err;
                 }
                 continue;
+                //////////////////////////////////////////////////////////////////////
+                // #endif
+                //////////////////////////////////////////////////////////////////////
             } else if (std.mem.startsWith(u8, trimmed_line, "#endif")) {
                 if (self.conditions.popOrNull() == null) {
                     const err = Error.MismatchedIf;
@@ -155,7 +164,7 @@ const ShaderPreprocessor = struct {
             }
 
             // If we are in an #if block, however nested, ensure we satisfy all conditions to
-            // actually further process any lines
+            // actually further process any lines, so linearly traverse the nested ifs
             var can_process = true;
             for (self.conditions.items) |cond| {
                 can_process = cond and can_process;
@@ -165,6 +174,9 @@ const ShaderPreprocessor = struct {
                 continue;
             }
 
+            //////////////////////////////////////////////////////////////////////
+            // #import "path/to/foo.wgsl"
+            //////////////////////////////////////////////////////////////////////
             if (std.mem.startsWith(u8, trimmed_line, "#import")) {
                 const import_bytes = self.processImport(abs_path, trimmed_line, options) catch |err| {
                     logError(err, log_data);
@@ -175,20 +187,23 @@ const ShaderPreprocessor = struct {
                     return Error.AllocatorError;
                 };
             } else {
+                //////////////////////////////////////////////////////////////////////
+                // var foo = #(bar) + #(baz);
+                //////////////////////////////////////////////////////////////////////
+                var line_buf: [ShaderPreprocessor.MAX_LINE_BYTES]u8 = undefined;
+                std.mem.copyForwards(u8, &line_buf, line);
+                var line_slice = line_buf[0..line.len];
 
-                // Lastly, check if there is a constant #(foo) inlined somewhere
-                // TODO: Allow multiple constants per line
-                const pound_index = std.mem.indexOfScalar(u8, line, '#');
-                if (pound_index) |pound_i| {
-                    const constant_ident = self.parseConstant(line[pound_i..]) catch |err| {
+                var pound_index = std.mem.indexOfScalar(u8, line_slice, '#');
+                while (pound_index) |pound_i| {
+                    const constant_ident = self.parseConstant(line_slice[pound_i..]) catch |err| {
                         logError(err, log_data);
                         return err;
                     };
                     defer self.allocator.free(constant_ident);
 
                     var const_valid = false;
-                    // TODO: This seems a little fishy
-                    var valueBuf: [128]u8 = undefined;
+                    var value_buf: [128]u8 = undefined;
                     var value: []u8 = "";
 
                     if (@hasField(@TypeOf(options), "constants")) {
@@ -196,7 +211,7 @@ const ShaderPreprocessor = struct {
                             if (std.mem.eql(u8, field.name, constant_ident)) {
                                 const_valid = true;
                                 const val = @field(options.constants, field.name);
-                                value = std.fmt.bufPrint(&valueBuf, "{any}", .{val}) catch {
+                                value = std.fmt.bufPrint(&value_buf, "{any}", .{val}) catch {
                                     return Error.InvalidConstant;
                                 };
                             }
@@ -210,19 +225,20 @@ const ShaderPreprocessor = struct {
                     }
 
                     // Process the line
-                    var lineBuf: [128]u8 = undefined;
-                    var newLine = std.fmt.bufPrint(&lineBuf, "{s}{s}{s}", .{ line[0..pound_i], value, line[pound_i + constant_ident.len + 3 ..] }) catch {
+                    var new_line_buf: [ShaderPreprocessor.MAX_LINE_BYTES]u8 = undefined;
+                    var new_line_slice = std.fmt.bufPrint(&new_line_buf, "{s}{s}{s}", .{ line_slice[0..pound_i], value, line_slice[pound_i + constant_ident.len + 3 ..] }) catch {
                         return Error.SyntaxError;
                     };
 
-                    process_array.appendSlice(newLine) catch {
-                        return Error.AllocatorError;
-                    };
-                } else {
-                    process_array.appendSlice(line) catch {
-                        return Error.AllocatorError;
-                    };
+                    // Copy back the line into the other buffer for later constant substitutions in the same line
+                    @memcpy(&line_buf, &new_line_buf);
+                    line_slice = line_buf[0..new_line_slice.len];
+
+                    pound_index = std.mem.indexOfScalar(u8, line_slice, '#');
                 }
+                process_array.appendSlice(line_slice) catch {
+                    return Error.AllocatorError;
+                };
             }
             if (it.rest().len > 0) {
                 process_array.append('\n') catch {
@@ -511,6 +527,8 @@ test "process conditional success" {
     const result = try preprocessor.process("./test/conditional.wgsl", .{
         .conditions = .{
             .test_condition = true,
+            .false_condition = false,
+            .true_condition = true,
         },
     });
     defer allocator.free(result);
@@ -525,6 +543,8 @@ test "process conditional success" {
     const result_false = try preprocessor.process("./test/conditional.wgsl", .{
         .conditions = .{
             .test_condition = false,
+            .false_condition = false,
+            .true_condition = true,
         },
     });
     defer allocator.free(result_false);
@@ -545,6 +565,9 @@ test "process constant success" {
     const result = try preprocessor.process("./test/constant.wgsl", .{
         .constants = .{
             .some_constant = 100,
+            .left_operand = 420,
+            .right_operand = 69,
+            .workgroup_size = 8,
         },
     });
     defer allocator.free(result);
@@ -552,6 +575,11 @@ test "process constant success" {
     const expected =
         \\var a = 10;
         \\var b = 100;
+        \\var c = 420 + 69;
+        \\
+        \\@compute @workgroup_size(8, 8, 8)
+        \\fn main() {
+        \\}
     ;
 
     try std.testing.expectEqualStrings(expected, result);
