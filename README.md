@@ -67,7 +67,7 @@ fn main() {
 ```zig
 // ... somewhere in your Zig code
 const processed_wgsl = ShaderPreprocessor.process("constants.wgsl", .{
-    .constants = {
+    .constants = .{
         .workgroup_x = app.config.workgroup_size,
         .workgroup_y = app.config.workgroup_size, 
     }
@@ -80,6 +80,52 @@ const processed_wgsl = ShaderPreprocessor.process("constants.wgsl", .{
 @compute @workgroup_size(#(workgroup_x), #(workgroup_y), 1)
 fn main() {
 }
+```
+
+### Removing comments and whitespace
+There are options available for removing comments and whitespace:
+```zig
+// ... somewhere in your Zig code
+const processed_wgsl = ShaderPreprocessor.process("comment.wgsl", .{
+    .options = .{
+      .remove_comments = true,
+      .remove_whitespace = true,
+    }
+});
+```
+
+*comment.wgsl*:
+
+```wgsl
+var a = 1;
+/*
+* This is a block comment
+*
+*/
+
+var b = 2;
+
+// This is a line comment
+// Here's another
+
+var c = 3;
+// Comment at the end!
+```
+
+*Result with only remove_comments = true*:
+```wgsl
+var a = 1;
+
+var b = 2;
+
+
+var c = 3;
+
+```
+
+*Result with both remove_comments = true and remove_whitespace = true*:
+```wgsl
+var a = 1;var b = 2;var c = 3;
 ```
 
 ## Dependencies

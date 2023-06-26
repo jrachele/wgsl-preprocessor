@@ -3,21 +3,15 @@ const mecha = @import("mecha");
 
 const testing = std.testing;
 
-export fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-
 const ShaderPreprocessor = struct {
     allocator: std.mem.Allocator,
-
-    // Contains retrieved shader data from files, cached in memory
-    shader_file_cache: std.StringHashMap([]const u8),
 
     // Fields for internal usage
     arena: std.heap.ArenaAllocator,
     visited_paths: std.StringHashMap(void),
+
+    // Contains retrieved shader data from files, cached in memory
+    shader_file_cache: std.StringHashMap([]const u8),
 
     // Stack to ensure proper if-endif formation
     conditions: std.ArrayList(bool),
@@ -60,6 +54,10 @@ const ShaderPreprocessor = struct {
     // Processes the shader at the given path
     // Options can be given as such:
     // .{
+    //  .options = .{
+    //      .remove_whitespace = true,
+    //      .remove_comments = true,
+    //  },
     //  .conditions = .{
     //      .full_screen = true,
     //      .mouse_hidden = global.config.mouse_hidden,
@@ -70,6 +68,18 @@ const ShaderPreprocessor = struct {
     //  }
     // }
     pub fn process(self: *Self, path: []const u8, options: anytype) Error![]const u8 {
+        comptime var remove_whitespace = false;
+        comptime var remove_comments = false;
+
+        if (@hasField(@TypeOf(options), "options")) {
+            if (@hasField(@TypeOf(options.options), "remove_whitespace")) {
+                remove_whitespace = options.options.remove_whitespace;
+            }
+            if (@hasField(@TypeOf(options.options), "remove_comments")) {
+                remove_comments = options.options.remove_comments;
+            }
+        }
+
         var path_buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
         const abs_path = std.fs.realpath(path, &path_buffer) catch {
             return Error.InvalidPath;
@@ -95,10 +105,9 @@ const ShaderPreprocessor = struct {
 
         var it = std.mem.splitScalar(u8, file_bytes, '\n');
         var i: u32 = 0;
-        while (it.next()) |line| : (i += 1) {
-
+        parser_loop: while (it.next()) |line| : (i += 1) {
             // Only throw parser errors if the line is meant to be parsed, i.e. starts with #
-            const trimmed_line = std.mem.trim(u8, line, " \t");
+            const trimmed_line = std.mem.trim(u8, line, " \t\n");
             const log_data = LogData{
                 .path = abs_path,
                 .line_number = i + 1,
@@ -175,6 +184,23 @@ const ShaderPreprocessor = struct {
             }
 
             //////////////////////////////////////////////////////////////////////
+            // Comments: /* */ * //
+            //////////////////////////////////////////////////////////////////////
+            const comment_prefixes = [_][]const u8{
+                "/*",
+                "*/",
+                "*",
+                "//",
+            };
+            if (remove_comments) {
+                for (comment_prefixes) |prefix| {
+                    if (std.mem.startsWith(u8, trimmed_line, prefix)) {
+                        continue :parser_loop;
+                    }
+                }
+            }
+
+            //////////////////////////////////////////////////////////////////////
             // #import "path/to/foo.wgsl"
             //////////////////////////////////////////////////////////////////////
             if (std.mem.startsWith(u8, trimmed_line, "#import")) {
@@ -240,7 +266,7 @@ const ShaderPreprocessor = struct {
                     return Error.AllocatorError;
                 };
             }
-            if (it.rest().len > 0) {
+            if (it.rest().len > 0 and !remove_whitespace) {
                 process_array.append('\n') catch {
                     return Error.AllocatorError;
                 };
@@ -580,6 +606,51 @@ test "process constant success" {
         \\@compute @workgroup_size(8, 8, 8)
         \\fn main() {
         \\}
+    ;
+
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "process comment success" {
+    const allocator = std.testing.allocator;
+    var preprocessor = ShaderPreprocessor.init(allocator);
+    defer preprocessor.deinit();
+
+    const result = try preprocessor.process("./test/comment.wgsl", .{
+        .options = .{
+            .remove_comments = true,
+        },
+    });
+    defer allocator.free(result);
+
+    const expected =
+        \\var a = 1;
+        \\
+        \\var b = 2;
+        \\
+        \\
+        \\var c = 3;
+        \\
+    ;
+
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "process comment whitespace success" {
+    const allocator = std.testing.allocator;
+    var preprocessor = ShaderPreprocessor.init(allocator);
+    defer preprocessor.deinit();
+
+    const result = try preprocessor.process("./test/comment.wgsl", .{
+        .options = .{
+            .remove_comments = true,
+            .remove_whitespace = true,
+        },
+    });
+    defer allocator.free(result);
+
+    const expected =
+        \\var a = 1;var b = 2;var c = 3;
     ;
 
     try std.testing.expectEqualStrings(expected, result);
